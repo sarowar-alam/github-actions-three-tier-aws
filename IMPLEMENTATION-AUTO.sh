@@ -405,6 +405,13 @@ server {
         access_log off;
         log_not_found off;
     }
+
+    # ── Silence favicon 404 log noise ─────────────────
+    location = /favicon.ico {
+        try_files \$uri =204;
+        access_log off;
+        log_not_found off;
+    }
 }
 NGINX
 
