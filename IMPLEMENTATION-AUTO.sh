@@ -74,6 +74,8 @@ BACKEND_DIR="$SCRIPT_DIR/backend"
 FRONTEND_DIR="$SCRIPT_DIR/frontend"
 MIGRATIONS_DIR="$BACKEND_DIR/migrations"
 FRONTEND_DIST="$FRONTEND_DIR/dist"
+# Web root served by nginx — outside /home so www-data never needs chmod hacks
+SERVE_DIR="/var/www/html/bmi-health-tracker"
 
 [[ -d "$BACKEND_DIR" ]]    || die "backend/ not found — run from the repo root."
 [[ -d "$FRONTEND_DIR" ]]   || die "frontend/ not found — run from the repo root."
@@ -321,12 +323,14 @@ su - "$CURRENT_USER" -c "
 [[ -d "$FRONTEND_DIST" ]] || die "Vite build failed — $FRONTEND_DIST not found."
 ok "Frontend built → $FRONTEND_DIST"
 
-# Grant nginx (www-data) traversal rights.
-# Ubuntu 24.04 sets /home/ubuntu to 750 by default, which causes nginx to get
-# EACCES (Permission denied) when it tries to stat files inside frontend/dist.
-chmod o+x "$USER_HOME"
-chmod -R o+rx "$FRONTEND_DIST"
-ok "Permissions set — nginx can read $FRONTEND_DIST"
+# Copy build output to /var/www — www-data owns this tree by default.
+# This avoids all /home/ubuntu permission issues entirely.
+mkdir -p "$SERVE_DIR"
+rm -rf "${SERVE_DIR:?}/"*
+cp -a "$FRONTEND_DIST/." "$SERVE_DIR/"
+chown -R www-data:www-data "$SERVE_DIR"
+chmod -R 755 "$SERVE_DIR"
+ok "Frontend deployed → $SERVE_DIR"
 
 # ============================================================
 step "6 / 8 — Nginx"
@@ -348,7 +352,7 @@ server {
     listen [::]:80;
     server_name ${SERVER_NAME};
 
-    root ${FRONTEND_DIST};
+    root ${SERVE_DIR};
     index index.html;
 
     # ── Gzip compression ──────────────────────────────
@@ -423,11 +427,12 @@ rm -f /etc/nginx/sites-enabled/default
   systemctl restart nginx
   ok "Nginx configured and running"
 else
-  # Reload nginx to serve the new Vite build.
-  # Validate config first so a broken config surfaces as a hard error.
+  # On re-deploy, update the root path in the nginx config (certbot may have
+  # rewritten it) and reload nginx. reload-or-restart handles a stopped nginx.
+  sed -i "s|root /[^;]*/frontend/dist;|root ${SERVE_DIR};|g" /etc/nginx/sites-available/healthtracker 2>/dev/null || true
   nginx -t || die "Nginx config test failed — run: sudo nginx -t"
-  systemctl reload nginx
-  ok "Nginx reloaded — serving new frontend build"
+  systemctl reload-or-restart nginx
+  ok "Nginx reloaded — serving new frontend build from $SERVE_DIR"
 fi
 
 # ============================================================
@@ -545,8 +550,9 @@ if [[ "$USE_SSL" == true ]]; then
 else
   HEALTH_URL="http://127.0.0.1/health"
 fi
-# curl already writes "000" to %{http_code} on connection failure — no || fallback needed.
-HTTP_STATUS=$(curl -sk -o /dev/null -w "%{http_code}" "$HEALTH_URL" 2>/dev/null)
+# curl exits non-zero (code 7) when it can't connect; || true prevents
+# set -euo pipefail from killing the script. %{http_code} will be "000".
+HTTP_STATUS=$(curl -sk -o /dev/null -w "%{http_code}" "$HEALTH_URL" 2>/dev/null || true)
 if [[ "$HTTP_STATUS" == "200" ]]; then
   ok "Health check ($HEALTH_URL): $HTTP_STATUS ✓"
 else
