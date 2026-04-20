@@ -28,10 +28,11 @@ on:
   push:
     branches: [main]
 
-# Grant the built-in GITHUB_TOKEN permission to manage Actions runners.
-# This avoids needing a separate PAT secret for runner registration.
+# GITHUB_TOKEN cannot generate runner registration tokens (requires
+# administration:write which is not grantable to the built-in token).
+# A PAT with Administration scope is used for that one API call instead.
+# See: repo → Settings → Secrets → GH_PAT
 permissions:
-  actions: write
   contents: read
 
 # Never cancel a running deploy — queue the next one instead.
@@ -111,8 +112,13 @@ jobs:
       - name: Get runner registration token from GitHub API
         id: reg-token
         run: |
+          # GITHUB_TOKEN cannot call this endpoint — administration:write is
+          # required, which is only available on PATs, not the built-in token.
+          # GH_PAT must be a classic PAT or fine-grained PAT with:
+          #   Classic PAT     : "Administration" scope
+          #   Fine-grained PAT: "Self-hosted runners" → Read and write
           RESPONSE=$(curl -sf -X POST \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Authorization: Bearer ${{ secrets.GH_PAT }}" \
             -H "Accept: application/vnd.github.v3+json" \
             "https://api.github.com/repos/${{ github.repository }}/actions/runners/registration-token" \
             2>&1) || {
@@ -122,8 +128,9 @@ jobs:
           }
           TOKEN=$(echo "$RESPONSE" | jq -r '.token // empty')
           [[ -z "$TOKEN" ]] && {
-            echo "::error::Registration token is empty — GITHUB_TOKEN may lack actions:write permission"
-            echo "Ensure the workflow has 'permissions: actions: write' (already set) and the repo allows it"
+            echo "::error::Registration token is empty"
+            echo "GH_PAT must have Administration scope (classic PAT)"
+            echo "or 'Self-hosted runners: Read and write' (fine-grained PAT)"
             echo "API response: $RESPONSE"
             exit 1
           }
