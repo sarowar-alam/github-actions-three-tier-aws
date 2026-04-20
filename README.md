@@ -1,4 +1,4 @@
-# BMI Health Tracker
+# BMI Health Tracker ||| Test Deployment
 
 A production-ready, three-tier web application for tracking BMI, BMR, and daily calorie requirements over time. The full deployment lifecycle — from code commit to live production — is automated via GitHub Actions with a self-hosted runner on AWS EC2.
 
