@@ -50,39 +50,92 @@ jobs:
     name: Setup self-hosted runner on EC2
     runs-on: ubuntu-latest
 
+    # Opt into Node.js 24 to silence the Node.js 20 deprecation warning
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
     steps:
 
       - name: Checkout (needed for .github/scripts/setup-runner.sh)
         uses: actions/checkout@v4
 
+      - name: Validate required secrets are set
+        run: |
+          MISSING=""
+          [[ -z "${{ secrets.EC2_HOST }}"    ]] && MISSING="${MISSING} EC2_HOST"
+          [[ -z "${{ secrets.EC2_SSH_KEY }}" ]] && MISSING="${MISSING} EC2_SSH_KEY"
+          if [[ -n "$MISSING" ]]; then
+            echo "::error::Missing required secrets:${MISSING}"
+            echo "Add them at: repo → Settings → Secrets and variables → Actions"
+            exit 1
+          fi
+          echo "All required secrets are present"
+
       - name: Configure SSH access to EC2
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/ec2_key.pem
+          # Write key — handle both raw PEM and base64-encoded variants
+          KEY="${{ secrets.EC2_SSH_KEY }}"
+          if echo "$KEY" | grep -q "BEGIN"; then
+            echo "$KEY" > ~/.ssh/ec2_key.pem
+          else
+            echo "$KEY" | base64 -d > ~/.ssh/ec2_key.pem
+          fi
           chmod 600 ~/.ssh/ec2_key.pem
-          # Add EC2 host to known_hosts so SSH doesn't prompt
+          # Verify key is a valid PEM
+          ssh-keygen -l -f ~/.ssh/ec2_key.pem >/dev/null 2>&1 || {
+            echo "::error::EC2_SSH_KEY does not appear to be a valid PEM private key"
+            echo "Open your .pem file and copy the full contents including the header/footer lines"
+            exit 1
+          }
+          echo "SSH key loaded and validated"
+          # Add EC2 host to known_hosts so SSH does not prompt
           ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Test SSH connectivity to EC2
+        run: |
+          echo "Testing SSH connection to ${{ secrets.EC2_HOST }}..."
+          ssh -i ~/.ssh/ec2_key.pem \
+            -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=15 \
+            ubuntu@${{ secrets.EC2_HOST }} \
+            "echo 'SSH OK — connected as $(whoami) on $(hostname)'" \
+          || {
+            echo "::error::Cannot SSH into EC2 at ${{ secrets.EC2_HOST }}"
+            echo "Check: 1) EC2 security group allows port 22 from 0.0.0.0/0"
+            echo "       2) EC2_HOST is the correct public IP or hostname"
+            echo "       3) EC2_SSH_KEY matches the key pair used when launching the instance"
+            exit 1
+          }
 
       - name: Get runner registration token from GitHub API
         id: reg-token
         run: |
-          TOKEN=$(curl -sf -X POST \
+          RESPONSE=$(curl -sf -X POST \
             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/vnd.github.v3+json" \
             "https://api.github.com/repos/${{ github.repository }}/actions/runners/registration-token" \
-            | jq -r '.token')
-          [[ -z "$TOKEN" || "$TOKEN" == "null" ]] && {
-            echo "ERROR: could not get runner registration token"
-            echo "Check that GITHUB_TOKEN has actions:write permission"
+            2>&1) || {
+            echo "::error::GitHub API call failed — could not get runner registration token"
+            echo "Response: $RESPONSE"
+            exit 1
+          }
+          TOKEN=$(echo "$RESPONSE" | jq -r '.token // empty')
+          [[ -z "$TOKEN" ]] && {
+            echo "::error::Registration token is empty — GITHUB_TOKEN may lack actions:write permission"
+            echo "Ensure the workflow has 'permissions: actions: write' (already set) and the repo allows it"
+            echo "API response: $RESPONSE"
             exit 1
           }
           echo "::add-mask::${TOKEN}"
           echo "token=${TOKEN}" >> "$GITHUB_OUTPUT"
+          echo "Runner registration token obtained"
 
       - name: Install and start runner on EC2 (idempotent)
         run: |
           ssh -i ~/.ssh/ec2_key.pem \
             -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=15 \
             ubuntu@${{ secrets.EC2_HOST }} \
             "REPO='${{ github.repository }}' REG_TOKEN='${{ steps.reg-token.outputs.token }}' bash -s" \
             < .github/scripts/setup-runner.sh
