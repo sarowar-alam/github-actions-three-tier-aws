@@ -12,7 +12,7 @@
 #    sudo ./IMPLEMENTATION-AUTO.sh
 #
 #    # With custom domain + Let's Encrypt SSL:
-#    sudo ./IMPLEMENTATION-AUTO.sh -d app.example.com -e admin@example.com
+#    sudo ./IMPLEMENTATION-AUTO.sh -d bmi.ostaddevops.click -e admin@bmi.ostaddevops.click
 #
 #  Options:
 #    -d | --domain   Your domain name (must resolve to this server's IP)
@@ -263,6 +263,13 @@ su - "$CURRENT_USER" -c "
 [[ -d "$FRONTEND_DIST" ]] || die "Vite build failed — $FRONTEND_DIST not found."
 ok "Frontend built → $FRONTEND_DIST"
 
+# Grant nginx (www-data) traversal rights.
+# Ubuntu 24.04 sets /home/ubuntu to 750 by default, which causes nginx to get
+# EACCES (Permission denied) when it tries to stat files inside frontend/dist.
+chmod o+x "$USER_HOME"
+chmod -R o+rx "$FRONTEND_DIST"
+ok "Permissions set — nginx can read $FRONTEND_DIST"
+
 # ============================================================
 step "6 / 8 — Nginx"
 # ============================================================
@@ -364,35 +371,51 @@ step "8 / 8 — SSL via Let's Encrypt (Certbot)"
 if [[ "$USE_SSL" == true ]]; then
   apt-get install -y -qq certbot python3-certbot-nginx
 
-  # DNS pre-flight check
-  info "Checking DNS resolution for $DOMAIN..."
-  RESOLVED_IP=$(host -t A "$DOMAIN" 2>/dev/null \
-    | grep "has address" | head -1 | awk '{print $NF}' || echo "")
-
-  if [[ -z "$RESOLVED_IP" ]]; then
-    warn "Could not resolve $DOMAIN — DNS may not have propagated yet."
-    warn "Certbot will fail if $DOMAIN does not point to $PUBLIC_IP"
-  elif [[ "$RESOLVED_IP" != "$PUBLIC_IP" ]]; then
-    warn "DNS mismatch:"
-    warn "  $DOMAIN resolves to : $RESOLVED_IP"
-    warn "  This server's IP    : $PUBLIC_IP"
-    warn "Fix your A record in Route53 (or DNS provider) before running again."
-    warn "Attempting certbot anyway..."
-  else
-    ok "DNS OK — $DOMAIN → $RESOLVED_IP"
+  # ── Check if a valid certificate already exists ───────────
+  CERT_FILE="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
+  CERT_SKIP=false
+  if [[ -f "$CERT_FILE" ]]; then
+    # openssl returns exit 0 if the cert is still valid, non-zero if expired
+    if openssl x509 -checkend 86400 -noout -in "$CERT_FILE" 2>/dev/null; then
+      EXPIRY=$(openssl x509 -noout -enddate -in "$CERT_FILE" 2>/dev/null | cut -d= -f2)
+      ok "Valid certificate already exists for $DOMAIN (expires: $EXPIRY) — skipping certbot"
+      CERT_SKIP=true
+    else
+      warn "Certificate for $DOMAIN exists but expires within 24 h — renewing..."
+    fi
   fi
 
-  # --nginx plugin: edits Nginx config, installs cert, redirects HTTP→HTTPS
-  certbot --nginx \
-    -d "$DOMAIN" \
-    --email "$EMAIL" \
-    --agree-tos \
-    --non-interactive \
-    --redirect \
-    && ok "SSL certificate issued — Nginx updated for https://${DOMAIN}" \
-    || die "Certbot failed.\n  → Ensure $DOMAIN points to $PUBLIC_IP\n  → Ensure port 80 is open in your AWS security group"
+  if [[ "$CERT_SKIP" == false ]]; then
+    # DNS pre-flight check
+    info "Checking DNS resolution for $DOMAIN..."
+    RESOLVED_IP=$(host -t A "$DOMAIN" 2>/dev/null \
+      | grep "has address" | head -1 | awk '{print $NF}' || echo "")
 
-  # Enable auto-renewal timer
+    if [[ -z "$RESOLVED_IP" ]]; then
+      warn "Could not resolve $DOMAIN — DNS may not have propagated yet."
+      warn "Certbot will fail if $DOMAIN does not point to $PUBLIC_IP"
+    elif [[ "$RESOLVED_IP" != "$PUBLIC_IP" ]]; then
+      warn "DNS mismatch:"
+      warn "  $DOMAIN resolves to : $RESOLVED_IP"
+      warn "  This server's IP    : $PUBLIC_IP"
+      warn "Fix your A record in Route53 (or DNS provider) before running again."
+      warn "Attempting certbot anyway..."
+    else
+      ok "DNS OK — $DOMAIN → $RESOLVED_IP"
+    fi
+
+    # --nginx plugin: edits Nginx config, installs cert, redirects HTTP→HTTPS
+    certbot --nginx \
+      -d "$DOMAIN" \
+      --email "$EMAIL" \
+      --agree-tos \
+      --non-interactive \
+      --redirect \
+      && ok "SSL certificate issued — Nginx updated for https://${DOMAIN}" \
+      || die "Certbot failed.\n  → Ensure $DOMAIN points to $PUBLIC_IP\n  → Ensure port 80 is open in your AWS security group"
+  fi
+
+  # Enable auto-renewal timer (idempotent)
   systemctl enable certbot.timer >/dev/null 2>&1 || true
   systemctl start  certbot.timer >/dev/null 2>&1 || true
   ok "certbot.timer enabled — auto-renewal every 12 hours"
@@ -434,11 +457,18 @@ ok ".setup-credentials added to .gitignore"
 # ============================================================
 step "Smoke test"
 sleep 2
-HTTP_STATUS=$(curl -so /dev/null -w "%{http_code}" "http://127.0.0.1/health" 2>/dev/null || echo "000")
-if [[ "$HTTP_STATUS" == "200" ]]; then
-  ok "HTTP health check: $HTTP_STATUS ✓"
+# After certbot rewrites nginx, the HTTP block returns 404 for requests by IP
+# (host != domain), so check via HTTPS when SSL is enabled.
+if [[ "$USE_SSL" == true ]]; then
+  HEALTH_URL="https://${DOMAIN}/health"
 else
-  warn "Health check returned HTTP $HTTP_STATUS — the app may still be warming up"
+  HEALTH_URL="http://127.0.0.1/health"
+fi
+HTTP_STATUS=$(curl -sk -o /dev/null -w "%{http_code}" "$HEALTH_URL" 2>/dev/null || echo "000")
+if [[ "$HTTP_STATUS" == "200" ]]; then
+  ok "Health check ($HEALTH_URL): $HTTP_STATUS ✓"
+else
+  warn "Health check ($HEALTH_URL) returned HTTP $HTTP_STATUS — the app may still be warming up"
 fi
 
 # ============================================================
