@@ -423,8 +423,10 @@ rm -f /etc/nginx/sites-enabled/default
   systemctl restart nginx
   ok "Nginx configured and running"
 else
-  # Reload nginx so it picks up any new static asset files from the Vite build.
-  systemctl reload nginx >/dev/null 2>&1 || true
+  # Reload nginx to serve the new Vite build.
+  # Validate config first so a broken config surfaces as a hard error.
+  nginx -t || die "Nginx config test failed — run: sudo nginx -t"
+  systemctl reload nginx
   ok "Nginx reloaded — serving new frontend build"
 fi
 
@@ -543,7 +545,8 @@ if [[ "$USE_SSL" == true ]]; then
 else
   HEALTH_URL="http://127.0.0.1/health"
 fi
-HTTP_STATUS=$(curl -sk -o /dev/null -w "%{http_code}" "$HEALTH_URL" 2>/dev/null || echo "000")
+# curl already writes "000" to %{http_code} on connection failure — no || fallback needed.
+HTTP_STATUS=$(curl -sk -o /dev/null -w "%{http_code}" "$HEALTH_URL" 2>/dev/null)
 if [[ "$HTTP_STATUS" == "200" ]]; then
   ok "Health check ($HEALTH_URL): $HTTP_STATUS ✓"
 else
