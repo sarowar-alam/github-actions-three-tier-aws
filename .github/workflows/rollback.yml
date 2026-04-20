@@ -1,0 +1,218 @@
+# ============================================================
+#  rollback.yml — Manual rollback to any previous commit
+#
+#  Trigger  : workflow_dispatch (GitHub UI → Actions → Rollback → Run)
+#  Runner   : self-hosted runner installed on the EC2 instance
+#
+#  Input    : commit_sha (optional)
+#               blank     → rolls back to HEAD~1 (previous commit)
+#               any SHA   → rolls back to that exact commit
+#
+#  What this does:
+#    - Checks out the target commit
+#    - Rebuilds backend (npm install + PM2 reload)
+#    - Rebuilds frontend (Vite build + copy to /var/www)
+#    - Reloads nginx
+#    - Verifies health endpoint returns 200
+#
+#  Infrastructure (packages, DB, nginx config, certbot) is NOT touched —
+#  rollback only restores application code and static assets.
+#
+#  Required secrets:
+#    DEPLOY_DOMAIN   e.g. bmi.ostaddevops.click
+#    DEPLOY_EMAIL    e.g. admin@bmi.ostaddevops.click
+# ============================================================
+
+name: Rollback Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: "Commit SHA to roll back to (leave blank for HEAD~1)"
+        required: false
+        default: ""
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    name: Rollback
+    runs-on: [self-hosted, linux, x64]
+
+    env:
+      DOMAIN:    ${{ secrets.DEPLOY_DOMAIN }}
+      EMAIL:     ${{ secrets.DEPLOY_EMAIL }}
+      SERVE_DIR: /var/www/html/bmi-health-tracker
+      DB_NAME:   healthtracker
+      DB_USER:   ht_user
+
+    steps:
+
+      # ── 1. Resolve target commit SHA ──────────────────────────────────────
+      - name: Resolve target commit
+        id: target
+        run: |
+          INPUT_SHA="${{ github.event.inputs.commit_sha }}"
+
+          # Fetch recent history so short SHAs and HEAD~n refs can be resolved
+          git fetch origin --depth=50 2>/dev/null || true
+
+          if [[ -n "$INPUT_SHA" ]]; then
+            FULL_SHA=$(git rev-parse "${INPUT_SHA}" 2>/dev/null) || {
+              echo "::error::Cannot resolve commit: ${INPUT_SHA}"; exit 1
+            }
+          else
+            FULL_SHA=$(git rev-parse HEAD~1 2>/dev/null) || {
+              echo "::error::Cannot determine HEAD~1 — not enough history"; exit 1
+            }
+          fi
+
+          SHORT_SHA=$(git rev-parse --short "${FULL_SHA}")
+          CURRENT_SHA=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+
+          echo "sha=${FULL_SHA}"    >> "$GITHUB_OUTPUT"
+          echo "short=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Rolling back: ${CURRENT_SHA} → ${SHORT_SHA}"
+
+      # ── 2. Read DB credentials from existing .env ─────────────────────────
+      # Rollback never touches the database — we only need the password to
+      # keep the backend .env intact (it's preserved, not rewritten).
+      - name: Read DB credentials
+        run: |
+          BACKEND_ENV="$GITHUB_WORKSPACE/backend/.env"
+          [[ -f "$BACKEND_ENV" ]] || {
+            echo "ERROR: backend/.env not found — is this server set up?"
+            echo "Run a fresh install via a push to main first."
+            exit 1
+          }
+          DB_PASS=$(grep '^DATABASE_URL=' "$BACKEND_ENV" \
+            | sed 's|.*://[^:]*:\([^@]*\)@.*|\1|')
+          [[ -z "$DB_PASS" ]] && {
+            echo "ERROR: cannot parse DB_PASS from $BACKEND_ENV"; exit 1
+          }
+          echo "::add-mask::${DB_PASS}"
+          echo "DB_PASS=${DB_PASS}" >> "$GITHUB_ENV"
+
+      # ── 3. Checkout target commit ─────────────────────────────────────────
+      # clean: false preserves backend/.env (gitignored)
+      - name: Checkout target commit
+        uses: actions/checkout@v4
+        with:
+          clean: false
+          ref: ${{ steps.target.outputs.sha }}
+
+      # ── 4. Restore backend ────────────────────────────────────────────────
+      - name: Restore backend
+        run: |
+          BACKEND_DIR="$GITHUB_WORKSPACE/backend"
+          cd "$BACKEND_DIR"
+          npm install --omit=dev --silent
+          echo "Backend packages installed"
+
+          mkdir -p "$BACKEND_DIR/logs"
+
+          # Rewrite ecosystem.config.js to point at the rolled-back BACKEND_DIR
+          cat > "$BACKEND_DIR/ecosystem.config.js" <<ECOSYSTEM
+          module.exports = {
+            apps: [{
+              name: 'ht-backend',
+              script: './src/server.js',
+              cwd: '${BACKEND_DIR}',
+              instances: 1,
+              autorestart: true,
+              watch: false,
+              max_memory_restart: '500M',
+              env_file: '${BACKEND_DIR}/.env',
+              env: {
+                NODE_ENV: 'production',
+                PORT: 3000
+              },
+              error_file: '${BACKEND_DIR}/logs/err.log',
+              out_file:   '${BACKEND_DIR}/logs/out.log',
+              log_file:   '${BACKEND_DIR}/logs/combined.log',
+              time: true,
+              merge_logs: true,
+              log_date_format: 'YYYY-MM-DD HH:mm:ss Z'
+            }]
+          };
+          ECOSYSTEM
+          echo "ecosystem.config.js updated"
+
+          pm2 reload "$BACKEND_DIR/ecosystem.config.js" --update-env 2>/dev/null \
+            || pm2 start "$BACKEND_DIR/ecosystem.config.js"
+          pm2 save --force
+
+          echo "Waiting for backend on :3000..."
+          for i in {1..15}; do
+            curl -sf http://127.0.0.1:3000/health >/dev/null 2>&1 && break
+            [[ $i -eq 15 ]] && {
+              pm2 logs ht-backend --lines 30 --nostream || true
+              echo "ERROR: backend did not start within 45s"; exit 1
+            }
+            sleep 3
+          done
+          echo "Backend is up on :3000"
+
+      # ── 5. Restore frontend ───────────────────────────────────────────────
+      - name: Restore frontend
+        run: |
+          FRONTEND_DIR="$GITHUB_WORKSPACE/frontend"
+          cd "$FRONTEND_DIR"
+          npm install --silent
+          npm run build
+          [[ -d "$FRONTEND_DIR/dist" ]] || {
+            echo "ERROR: Vite build failed — dist/ not found"; exit 1
+          }
+
+          sudo rm -rf "${SERVE_DIR:?}/"*
+          sudo cp -a "$FRONTEND_DIR/dist/." "${SERVE_DIR}/"
+          sudo chown -R www-data:www-data "${SERVE_DIR}"
+          sudo chmod -R 755 "${SERVE_DIR}"
+          echo "Frontend deployed → ${SERVE_DIR}"
+
+      # ── 6. Reload nginx ───────────────────────────────────────────────────
+      - name: Reload nginx
+        run: |
+          sudo nginx -t
+          sudo systemctl reload-or-restart nginx
+          echo "Nginx reloaded"
+
+      # ── 7. Health check ───────────────────────────────────────────────────
+      - name: Health check
+        run: |
+          sleep 2
+          if [[ -n "${DOMAIN}" ]]; then
+            HEALTH_URL="https://${DOMAIN}/health"
+            HTTP_STATUS=$(curl -sk \
+              --resolve "${DOMAIN}:443:127.0.0.1" \
+              --max-time 15 \
+              -o /dev/null -w "%{http_code}" \
+              "$HEALTH_URL" 2>/dev/null || true)
+          else
+            HEALTH_URL="http://127.0.0.1/health"
+            HTTP_STATUS=$(curl -sk --max-time 15 \
+              -o /dev/null -w "%{http_code}" \
+              "$HEALTH_URL" 2>/dev/null || true)
+          fi
+          echo "Health check (${HEALTH_URL}): HTTP ${HTTP_STATUS}"
+          if [[ "$HTTP_STATUS" != "200" ]]; then
+            echo "::error::Health check failed after rollback — HTTP ${HTTP_STATUS}"
+            exit 1
+          fi
+
+      # ── 8. Summary ────────────────────────────────────────────────────────
+      - name: Rollback summary
+        if: success()
+        run: |
+          SHORT="${{ steps.target.outputs.short }}"
+          {
+            echo "### Rollback successful"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Rolled back to | \`${SHORT}\` |"
+            [[ -n "${DOMAIN}" ]] && echo "| URL | https://${DOMAIN} |"
+            echo "| Health | https://${DOMAIN}/health |"
+          } >> "$GITHUB_STEP_SUMMARY"
