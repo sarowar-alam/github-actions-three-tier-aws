@@ -139,7 +139,8 @@ github-actions-ci-cd/
 │   ├── package.json
 │   ├── migrations/
 │   │   ├── 001_create_measurements.sql   # Creates measurements table and indexes
-│   │   └── 002_add_measurement_date.sql  # Adds measurement_date column (idempotent)
+│   │   ├── 002_add_measurement_date.sql  # Adds measurement_date column (idempotent)
+│   │   └── 003_create_user_profile.sql   # Creates user_profile singleton table for form pre-fill
 │   └── src/
 │       ├── calculations.js         # BMI, BMR (Mifflin–St Jeor), calorie calculations
 │       ├── db.js                   # PostgreSQL connection pool
@@ -435,6 +436,8 @@ PGPASSWORD=localpassword psql -h 127.0.0.1 -U ht_user -d healthtracker \
   -f backend/migrations/001_create_measurements.sql
 PGPASSWORD=localpassword psql -h 127.0.0.1 -U ht_user -d healthtracker \
   -f backend/migrations/002_add_measurement_date.sql
+PGPASSWORD=localpassword psql -h 127.0.0.1 -U ht_user -d healthtracker \
+  -f backend/migrations/003_create_user_profile.sql
 ```
 
 ### 4. Configure the backend
