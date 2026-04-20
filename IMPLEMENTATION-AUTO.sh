@@ -14,6 +14,12 @@
 #    # With custom domain + Let's Encrypt SSL:
 #    sudo ./IMPLEMENTATION-AUTO.sh -d bmi.ostaddevops.click -e admin@bmi.ostaddevops.click
 #
+#  Re-deploy (run again on an existing server):
+#    sudo ./IMPLEMENTATION-AUTO.sh [-d domain -e email]
+#    → Detects existing backend/.env → runs git pull → rebuilds app
+#    → Skips apt installs, DB provisioning, Nginx config, UFW
+#    → Preserves DB password  → PM2 zero-downtime reload
+#
 #  Options:
 #    -d | --domain   Your domain name (must resolve to this server's IP)
 #    -e | --email    Email for Let's Encrypt registration (required with -d)
@@ -77,10 +83,22 @@ FRONTEND_DIST="$FRONTEND_DIR/dist"
 CURRENT_USER="${SUDO_USER:-ubuntu}"
 USER_HOME=$(getent passwd "$CURRENT_USER" | cut -d: -f6)
 
-# ── Database credentials (auto-generated) ────────────────────
+# ── Detect re-deploy vs fresh install ───────────────────────
+# A re-deploy is any run where backend/.env already exists.
+REDEPLOY=false
+[[ -f "$BACKEND_DIR/.env" ]] && REDEPLOY=true
+
+# ── Database credentials ─────────────────────────────────────
 DB_NAME="healthtracker"
 DB_USER="ht_user"
-DB_PASS="$(openssl rand -base64 32 | tr -dc 'a-zA-Z0-9' | head -c 28)"
+if [[ "$REDEPLOY" == true ]]; then
+  # Preserve the existing password — rotating it would break the live DB.
+  DB_PASS=$(grep '^DATABASE_URL=' "$BACKEND_DIR/.env" \
+    | sed 's|.*://[^:]*:\([^@]*\)@.*|\1|')
+  [[ -z "$DB_PASS" ]] && die "Could not parse DB password from $BACKEND_DIR/.env"
+else
+  DB_PASS="$(openssl rand -base64 32 | tr -dc 'a-zA-Z0-9' | head -c 28)"
+fi
 DB_URL="postgresql://${DB_USER}:${DB_PASS}@localhost:5432/${DB_NAME}"
 
 # ── Detect public IP ─────────────────────────────────────────
@@ -97,6 +115,11 @@ echo -e "${BOLD}╔════════════════════�
 echo -e "${BOLD}║       HealthTracker — Automated Setup            ║${NC}"
 echo -e "${BOLD}╚══════════════════════════════════════════════════╝${NC}"
 echo ""
+if [[ "$REDEPLOY" == true ]]; then
+  info "Mode       : RE-DEPLOY  (git pull + rebuild)"
+else
+  info "Mode       : FRESH INSTALL"
+fi
 info "Repo root  : $SCRIPT_DIR"
 info "OS user    : $CURRENT_USER  (home: $USER_HOME)"
 info "Public IP  : $PUBLIC_IP"
@@ -104,45 +127,60 @@ info "App URL    : $FRONTEND_ORIGIN"
 [[ "$USE_SSL" == true ]] && info "Domain     : $DOMAIN  (SSL via Let's Encrypt)"
 echo ""
 
+# ── Git pull on re-deploy (runs before any other step) ───────
+if [[ "$REDEPLOY" == true ]]; then
+  step "Git pull — fetching latest code"
+  su - "$CURRENT_USER" -c "cd '$SCRIPT_DIR' && git pull --ff-only" \
+    && ok "Repository updated" \
+    || die "git pull failed — resolve merge conflicts manually, then re-run"
+fi
+
 # ============================================================
-step "1 / 8 — System update & base packages"
+step "1 / 8 — System packages"
 # ============================================================
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get upgrade -y -qq
-apt-get install -y -qq \
-  curl wget git unzip gnupg lsb-release \
-  ca-certificates software-properties-common \
-  build-essential openssl dnsutils ufw
-ok "Base packages ready"
+if [[ "$REDEPLOY" == false ]]; then
+  apt-get update -qq
+  apt-get upgrade -y -qq
+  apt-get install -y -qq \
+    curl wget git unzip gnupg lsb-release \
+    ca-certificates software-properties-common \
+    build-essential openssl dnsutils ufw
+  ok "Base packages ready"
+else
+  ok "System packages — skipped (re-deploy)"
+fi
 
 # ============================================================
 step "2 / 8 — Node.js 20 LTS + PM2"
 # ============================================================
-NODE_MAJOR=20
-if ! command -v node &>/dev/null || \
-   [[ "$(node -v | cut -d. -f1 | tr -d 'v')" -lt 18 ]]; then
-  info "Installing Node.js ${NODE_MAJOR}..."
-  curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - >/dev/null 2>&1
-  apt-get install -y -qq nodejs
+if [[ "$REDEPLOY" == false ]]; then
+  NODE_MAJOR=20
+  if ! command -v node &>/dev/null || \
+     [[ "$(node -v | cut -d. -f1 | tr -d 'v')" -lt 18 ]]; then
+    info "Installing Node.js ${NODE_MAJOR}..."
+    curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - >/dev/null 2>&1
+    apt-get install -y -qq nodejs
+  fi
+  npm install -g pm2 --silent 2>/dev/null || npm install -g pm2
+  ok "Node $(node -v)  |  npm $(npm -v)  |  PM2 $(pm2 -v)"
+else
+  ok "Node.js + PM2 — skipped (re-deploy, already installed)"
 fi
-ok "Node $(node -v)  |  npm $(npm -v)"
-
-npm install -g pm2 --silent 2>/dev/null || npm install -g pm2
-ok "PM2 $(pm2 -v)"
 
 # ============================================================
 step "3 / 8 — PostgreSQL"
 # ============================================================
-if ! command -v psql &>/dev/null; then
-  apt-get install -y -qq postgresql postgresql-contrib
-fi
-systemctl enable postgresql --quiet
-systemctl start postgresql
-ok "PostgreSQL $(psql --version | awk '{print $3}') running"
+if [[ "$REDEPLOY" == false ]]; then
+  if ! command -v psql &>/dev/null; then
+    apt-get install -y -qq postgresql postgresql-contrib
+  fi
+  systemctl enable postgresql --quiet
+  systemctl start postgresql
+  ok "PostgreSQL $(psql --version | awk '{print $3}') running"
 
-info "Provisioning database user and schema..."
-sudo -u postgres psql -v ON_ERROR_STOP=1 <<SQL
+  info "Provisioning database user and schema..."
+  sudo -u postgres psql -v ON_ERROR_STOP=1 <<SQL
 DO \$\$
 BEGIN
   IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '${DB_USER}') THEN
@@ -162,10 +200,15 @@ SQL
 sudo -u postgres psql -d "${DB_NAME}" \
   -c "GRANT ALL ON SCHEMA public TO ${DB_USER};" >/dev/null 2>&1 || true
 
-ok "Database '${DB_NAME}' + user '${DB_USER}' ready"
+  ok "Database '${DB_NAME}' + user '${DB_USER}' ready"
+else
+  # Ensure PostgreSQL is running before migrations
+  systemctl start postgresql >/dev/null 2>&1 || true
+  ok "PostgreSQL provisioning — skipped (re-deploy)"
+fi
 
 info "Running migrations in order..."
-for MIGRATION in $(ls "$MIGRATIONS_DIR"/*.sql | sort); do
+while IFS= read -r MIGRATION; do
   MNAME="$(basename "$MIGRATION")"
   if PGPASSWORD="$DB_PASS" psql -h 127.0.0.1 -U "$DB_USER" -d "$DB_NAME" \
        -f "$MIGRATION" -q 2>&1; then
@@ -173,7 +216,7 @@ for MIGRATION in $(ls "$MIGRATIONS_DIR"/*.sql | sort); do
   else
     warn "  ↷ $MNAME — may already be applied, continuing"
   fi
-done
+done < <(find "$MIGRATIONS_DIR" -maxdepth 1 -name '*.sql' | sort)
 
 # ============================================================
 step "4 / 8 — Backend (Node.js / Express)"
@@ -182,16 +225,20 @@ cd "$BACKEND_DIR"
 npm install --omit=dev --silent
 ok "Backend npm packages installed"
 
-# Write .env
-cat > "$BACKEND_DIR/.env" <<ENV
+# Write .env (fresh install only — preserve existing creds on re-deploy)
+if [[ "$REDEPLOY" == false ]]; then
+  cat > "$BACKEND_DIR/.env" <<ENV
 PORT=3000
 DATABASE_URL=${DB_URL}
 NODE_ENV=production
 FRONTEND_URL=${FRONTEND_ORIGIN}
 ENV
-chmod 600 "$BACKEND_DIR/.env"
-chown "$CURRENT_USER:$CURRENT_USER" "$BACKEND_DIR/.env"
-ok ".env written (DB password auto-generated)"
+  chmod 600 "$BACKEND_DIR/.env"
+  chown "$CURRENT_USER:$CURRENT_USER" "$BACKEND_DIR/.env"
+  ok ".env written (DB password auto-generated)"
+else
+  ok ".env — kept existing (re-deploy)"
+fi
 
 # Create log directory
 mkdir -p "$BACKEND_DIR/logs"
@@ -230,12 +277,23 @@ ok "ecosystem.config.js updated with absolute paths"
 pm2 startup systemd -u "$CURRENT_USER" --hp "$USER_HOME" >/dev/null 2>&1 || true
 
 info "Starting backend via PM2..."
-su - "$CURRENT_USER" -c "
-  cd '$BACKEND_DIR'
-  pm2 delete ht-backend 2>/dev/null || true
-  pm2 start ecosystem.config.js
-  pm2 save --force
-"
+if [[ "$REDEPLOY" == true ]]; then
+  # reload ecosystem.config.js so any config changes (env, paths) are applied;
+  # --update-env passes the updated env block; falls back to start if not running
+  su - "$CURRENT_USER" -c "
+    cd '$BACKEND_DIR'
+    pm2 reload ecosystem.config.js --update-env 2>/dev/null \
+      || pm2 start ecosystem.config.js
+    pm2 save --force
+  "
+else
+  su - "$CURRENT_USER" -c "
+    cd '$BACKEND_DIR'
+    pm2 delete ht-backend 2>/dev/null || true
+    pm2 start ecosystem.config.js
+    pm2 save --force
+  "
+fi
 
 systemctl enable "pm2-${CURRENT_USER}" >/dev/null 2>&1 || true
 systemctl start  "pm2-${CURRENT_USER}" >/dev/null 2>&1 || true
@@ -273,8 +331,9 @@ ok "Permissions set — nginx can read $FRONTEND_DIST"
 # ============================================================
 step "6 / 8 — Nginx"
 # ============================================================
-apt-get install -y -qq nginx
-systemctl enable nginx --quiet
+if [[ "$REDEPLOY" == false ]]; then
+  apt-get install -y -qq nginx
+  systemctl enable nginx --quiet
 
 # server_name: _ catches all IPs; replace with domain if provided
 SERVER_NAME="_"
@@ -353,17 +412,26 @@ NGINX
 ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/healthtracker
 rm -f /etc/nginx/sites-enabled/default
 
-nginx -t || die "Nginx config test failed — check $NGINX_CONF"
-systemctl restart nginx
-ok "Nginx configured and running"
+  nginx -t || die "Nginx config test failed — check $NGINX_CONF"
+  systemctl restart nginx
+  ok "Nginx configured and running"
+else
+  # Reload nginx so it picks up any new static asset files from the Vite build.
+  systemctl reload nginx >/dev/null 2>&1 || true
+  ok "Nginx reloaded — serving new frontend build"
+fi
 
 # ============================================================
 step "7 / 8 — UFW firewall"
 # ============================================================
-ufw allow OpenSSH      >/dev/null 2>&1
-ufw allow 'Nginx Full' >/dev/null 2>&1
-ufw --force enable     >/dev/null 2>&1
-ok "UFW: SSH + HTTP + HTTPS allowed"
+if [[ "$REDEPLOY" == false ]]; then
+  ufw allow OpenSSH      >/dev/null 2>&1
+  ufw allow 'Nginx Full' >/dev/null 2>&1
+  ufw --force enable     >/dev/null 2>&1
+  ok "UFW: SSH + HTTP + HTTPS allowed"
+else
+  ok "UFW firewall — skipped (re-deploy)"
+fi
 
 # ============================================================
 step "8 / 8 — SSL via Let's Encrypt (Certbot)"
@@ -426,10 +494,11 @@ else
 fi
 
 # ============================================================
-# Save credentials to a local file (never commit this!)
+# Save credentials to a local file (fresh install only)
 # ============================================================
 CREDS_FILE="$SCRIPT_DIR/.setup-credentials"
-cat > "$CREDS_FILE" <<CREDS
+if [[ "$REDEPLOY" == false ]]; then
+  cat > "$CREDS_FILE" <<CREDS
 # HealthTracker setup credentials
 # Generated: $(date)
 # ⚠️  Keep this file safe — add to .gitignore — do NOT commit!
@@ -439,18 +508,21 @@ DB_USER=${DB_USER}
 DB_PASS=${DB_PASS}
 DB_URL=${DB_URL}
 CREDS
-chmod 600 "$CREDS_FILE"
-chown "$CURRENT_USER:$CURRENT_USER" "$CREDS_FILE"
-ok "Credentials saved to $CREDS_FILE"
+  chmod 600 "$CREDS_FILE"
+  chown "$CURRENT_USER:$CURRENT_USER" "$CREDS_FILE"
+  ok "Credentials saved to $CREDS_FILE"
 
-# Add to .gitignore if not already there
-GITIGNORE="$SCRIPT_DIR/.gitignore"
-if [[ -f "$GITIGNORE" ]]; then
-  grep -qxF ".setup-credentials" "$GITIGNORE" || echo ".setup-credentials" >> "$GITIGNORE"
+  # Add to .gitignore if not already there
+  GITIGNORE="$SCRIPT_DIR/.gitignore"
+  if [[ -f "$GITIGNORE" ]]; then
+    grep -qxF ".setup-credentials" "$GITIGNORE" || echo ".setup-credentials" >> "$GITIGNORE"
+  else
+    echo ".setup-credentials" > "$GITIGNORE"
+  fi
+  ok ".setup-credentials added to .gitignore"
 else
-  echo ".setup-credentials" > "$GITIGNORE"
+  ok "Credentials file — skipped (re-deploy, credentials unchanged)"
 fi
-ok ".setup-credentials added to .gitignore"
 
 # ============================================================
 # Smoke test
@@ -475,9 +547,18 @@ fi
 # Done
 # ============================================================
 echo ""
-echo -e "${GREEN}${BOLD}╔════════════════════════════════════════════════════════╗${NC}"
-echo -e "${GREEN}${BOLD}║   ✓  Setup Complete!                                   ║${NC}"
-echo -e "${GREEN}${BOLD}╚════════════════════════════════════════════════════════╝${NC}"
+if [[ "$REDEPLOY" == true ]]; then
+  GIT_REF=$(su - "$CURRENT_USER" -c "cd '$SCRIPT_DIR' && git log -1 --format='%h %s'" 2>/dev/null || echo "unknown")
+  echo -e "${GREEN}${BOLD}╔════════════════════════════════════════════════════════╗${NC}"
+  echo -e "${GREEN}${BOLD}║   ✓  Re-Deploy Complete!                               ║${NC}"
+  echo -e "${GREEN}${BOLD}╚════════════════════════════════════════════════════════╝${NC}"
+  echo ""
+  echo -e "  ${BOLD}Deployed commit :${NC}  $GIT_REF"
+else
+  echo -e "${GREEN}${BOLD}╔════════════════════════════════════════════════════════╗${NC}"
+  echo -e "${GREEN}${BOLD}║   ✓  Setup Complete!                                   ║${NC}"
+  echo -e "${GREEN}${BOLD}╚════════════════════════════════════════════════════════╝${NC}"
+fi
 echo ""
 if [[ "$USE_SSL" == true ]]; then
   echo -e "  ${BOLD}App URL      :${NC}  https://${DOMAIN}"
@@ -485,7 +566,7 @@ else
   echo -e "  ${BOLD}App URL      :${NC}  http://${PUBLIC_IP}"
 fi
 echo -e "  ${BOLD}Health check :${NC}  http://${PUBLIC_IP}/health"
-echo -e "  ${BOLD}DB creds     :${NC}  $CREDS_FILE"
+[[ "$REDEPLOY" == false ]] && echo -e "  ${BOLD}DB creds     :${NC}  $CREDS_FILE"
 echo ""
 echo -e "  ${BOLD}Useful commands:${NC}"
 echo -e "    su - ${CURRENT_USER} -c 'pm2 status'"
